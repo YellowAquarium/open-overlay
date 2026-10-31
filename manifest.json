@@ -1,0 +1,23 @@
+{
+  "id": "open-overlay",
+  "name": "Open Overlay",
+  "description": "Streams the full OpenRailwayMap vector dataset (tracks, platforms, stations, signals, speeds, electrification, gauges, operators, routes and more), plus optional satellite imagery, onto the Subway Builder map through a local proxy.",
+  "version": "1.0.0",
+  "author": {
+    "name": "YellowAquarium",
+    "url": "https://github.com/YellowAquarium/"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "subway-builder": ">=1.2.0"
+  },
+  "keywords": [
+    "subway-builder",
+    "mod",
+    "railway",
+    "openrailwaymap",
+    "overlay",
+    "vector",
+    "visual"
+  ]
+}
