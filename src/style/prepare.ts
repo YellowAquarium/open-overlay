@@ -226,6 +226,8 @@ export function prepareStyle(style: OrmStyle, options: PrepareOptions): Prepared
       next.url = withLanguage(next.url, options.language);
     }
     delete next.metadata;
+    // The proxy serves classic vector tiles (MVT); never ask the game to decode MLT.
+    delete next.encoding;
     sources[namespacedSourceId(options.namespace, id)] = next;
   }
 

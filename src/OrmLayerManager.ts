@@ -1,5 +1,5 @@
 import { MOD_ID, TAG, effectiveLanguage, type OverlaySettings } from './config';
-import type { InspectedFeature, OverlayStore } from './store';
+import { statusBaseUrl, type InspectedFeature, type OverlayStore } from './store';
 import {
   applyOpacity,
   bakeGlobalState,
@@ -44,7 +44,12 @@ export type MapLike = {
   triggerRepaint?: () => void;
   style?: { addLayer?: (layer: unknown, before?: string, options?: unknown) => void };
   _update?: (updateStyle?: boolean) => void;
+  refreshTiles?: (sourceId: string, tileIds?: Array<{ x: number; y: number; z: number }>) => void;
 };
+
+/** How often the mod asks the proxy which stand-in tiles now have their real tile ready. */
+const READY_POLL_MS = 2000;
+const TILE_NAME_FROM_URL = /\/orm\/tilejson\/([a-z0-9_,]+)/;
 
 const NS = MOD_ID;
 const STATE_PREFIX = 'orm_';
@@ -53,7 +58,12 @@ const SPRITE_RETRY_MS = 30000;
 const PITCH_LIMIT = 30;
 /** Game layers used to slot the overlay just below / just above the player's tracks. */
 const ANCHOR_BELOW_TRACKS = ['construction-tracks-base', 'tracks-base', 'tracks'];
-const ANCHOR_ABOVE_TRACKS = ['building-collision', 'stations', 'station-labels'];
+/**
+ * Game layers that draw track (built, under construction, and the build-mode previews such as
+ * blueprint tracks). "Above tracks" puts the overlay right after the highest of these, so it stays
+ * on top while the build menu adds its own track layers.
+ */
+const GAME_TRACK_LAYER = /(^|[-_])(tracks?|blueprint|construction|track-elevations?)([-_]|$)|blueprint/i;
 
 export class OrmLayerManager {
   private map: MapLike | null = null;
@@ -71,7 +81,15 @@ export class OrmLayerManager {
   private failedLayerIds = new Set<string>();
   private handlers: Array<[string, (event?: any) => void]> = [];
   private lastPitched = false;
+  private lastPlacement: string | null = null;
   private lastSpriteAttempt = 0;
+  private readyTimer: number | null = null;
+  private readySeq: number | null = null;
+  private readyBusy = false;
+  private reportTicks = 0;
+  private lastReport = '';
+  private tileErrors: string[] = [];
+  private tileRetries = new Map<string, number>();
 
   constructor(private readonly store: OverlayStore, private readonly attribution: MapAttribution) {}
 
@@ -147,6 +165,13 @@ export class OrmLayerManager {
     const settings = this.settings;
     if (!map || !settings) return;
     const token = ++this.syncToken;
+
+    if (settings.enabled && !this.store.isProxyReady() && this.onMapKey && this.prepared && this.allOnMap(this.prepared)) {
+      // The proxy isn't answering right now. Keep what's already on the map (loaded tiles stay
+      // visible); it carries on normally once the proxy answers again.
+      this.store.setLayerStatus({ phase: 'ready', message: 'Proxy not responding - showing what is already loaded' });
+      return;
+    }
 
     if (!settings.enabled || !this.store.isProxyReady()) {
       this.removeFromMap();
@@ -411,6 +436,11 @@ export class OrmLayerManager {
     const contiguous = lastIndex - firstIndex === ours.length - 1;
     const anchored = beforeId ? order.indexOf(beforeId) === lastIndex + 1 : lastIndex === order.length - 1;
     if (contiguous && anchored) return;
+    const placement = `${settings.aboveTracks ? 'above' : 'below'} tracks, before ${beforeId ?? 'top'}`;
+    if (placement !== this.lastPlacement) {
+      this.lastPlacement = placement;
+      console.info(`${TAG} Moving overlay ${placement}`);
+    }
     for (const id of ours) {
       try {
         map.moveLayer(id, beforeId);
@@ -433,10 +463,17 @@ export class OrmLayerManager {
 
   private resolveBeforeId(settings: OverlaySettings): string | undefined {
     const order = this.getLayerOrder();
-    const candidates = settings.aboveTracks ? ANCHOR_ABOVE_TRACKS : ANCHOR_BELOW_TRACKS;
-    const found = candidates.find((id) => order.includes(id));
+    if (settings.aboveTracks) {
+      const gameOrder = order.filter((id) => !id.startsWith(`${NS}:`));
+      let highestTrack = -1;
+      gameOrder.forEach((id, index) => {
+        if (GAME_TRACK_LAYER.test(id)) highestTrack = index;
+      });
+      // Directly above the top-most game track layer (or on top of everything if none is known).
+      return highestTrack >= 0 ? gameOrder[highestTrack + 1] : undefined;
+    }
+    const found = ANCHOR_BELOW_TRACKS.find((id) => order.includes(id));
     if (found) return found;
-    if (settings.aboveTracks) return undefined;
     // Below tracks but no known anchor: put the overlay under the first game symbol layer.
     const style = this.safeStyleLayers();
     const firstSymbol = style.find((layer) => layer.type === 'symbol' && !layer.id.startsWith(`${NS}:`));
@@ -506,6 +543,127 @@ export class OrmLayerManager {
     on('rotate', () => this.scheduleViewState());
     on('pitch', () => this.scheduleViewState());
     on('click', (event?: { point?: { x: number; y: number } }) => this.inspect(event?.point));
+    on('error', (event?: any) => this.onMapError(event));
+    this.readyTimer = window.setInterval(() => {
+      void this.refreshReadyTiles();
+      this.reportTicks += 1;
+      if (this.reportTicks % 5 === 0) this.reportTiles();
+    }, READY_POLL_MS);
+  }
+
+  /** A railway tile the map could not load or read: note it for the report and try it again. */
+  private onMapError(event?: any): void {
+    const sourceId: string | undefined = event?.sourceId ?? event?.source?.id;
+    if (!sourceId || !sourceId.startsWith(`${NS}:`)) return;
+    const id = event?.tile?.tileID?.canonical ?? event?.tileId?.canonical ?? event?.tile?.coord?.canonical;
+    const where = id ? `${id.z}/${id.x}/${id.y}` : '?';
+    const message = String(event?.error?.message ?? event?.error ?? 'unknown error').slice(0, 200);
+    this.tileErrors.push(`${shortSource(sourceId)} ${where}: ${message}`);
+    if (this.tileErrors.length > 30) this.tileErrors.splice(0, this.tileErrors.length - 30);
+    console.warn(`${TAG} Tile error ${shortSource(sourceId)} ${where}: ${message}`);
+    if (!id || !this.map) return;
+    const key = `${sourceId}|${where}`;
+    const tries = this.tileRetries.get(key) ?? 0;
+    if (tries >= 3) return;
+    this.tileRetries.set(key, tries + 1);
+    const map = this.map;
+    window.setTimeout(() => {
+      if (this.map === map && map.getSource(sourceId)) reloadTiles(map, sourceId, [{ x: id.x, y: id.y, z: id.z }]);
+    }, 3000 * (tries + 1));
+  }
+
+  /**
+   * Diagnostics: tells the proxy (logs/tiles.log) what the map holds for each railway source - how
+   * many tiles are loaded, still loading or failed, and how many features it can draw.
+   */
+  private reportTiles(): void {
+    const map = this.map;
+    const settings = this.settings;
+    const prepared = this.prepared;
+    if (!map || !settings?.enabled || !prepared || !this.onMapKey || !this.store.isProxyReady()) return;
+    try {
+      const style = (map as any).style;
+      const zoom = typeof (map as any).getZoom === 'function' ? Number((map as any).getZoom()).toFixed(1) : '?';
+      const center = typeof (map as any).getCenter === 'function' ? (map as any).getCenter() : null;
+      const parts: string[] = [`zoom ${zoom}${center ? ` at ${Number(center.lat).toFixed(3)},${Number(center.lng).toFixed(3)}` : ''}`];
+      for (const id of Object.keys(prepared.sources)) {
+        const cache = style?.sourceCaches?.[id] ?? style?.tileManagers?.[id] ?? style?._otherSourceCaches?.[id];
+        const tiles = cache?._tiles ? Object.values(cache._tiles) as any[] : [];
+        const states: Record<string, number> = {};
+        const stuck: string[] = [];
+        for (const tile of tiles) {
+          const state = String(tile?.state ?? '?');
+          states[state] = (states[state] ?? 0) + 1;
+          if ((state === 'errored' || state === 'loading') && stuck.length < 8) {
+            const c = tile?.tileID?.canonical;
+            if (c) stuck.push(`${state[0]}${c.z}/${c.x}/${c.y}`);
+          }
+        }
+        let features = '';
+        if (typeof (map as any).querySourceFeatures === 'function' && /line/.test(id)) {
+          try {
+            const layer = id.includes('railway_line_high') ? 'railway_line_high' : undefined;
+            features = ` features=${(map as any).querySourceFeatures(id, layer ? { sourceLayer: layer } : {}).length}`;
+          } catch {
+            // ignore
+          }
+        }
+        if (!tiles.length && !cache) {
+          parts.push(`${shortSource(id)}: no tile cache found`);
+          continue;
+        }
+        parts.push(`${shortSource(id)}: ${Object.entries(states).map(([k, v]) => `${k}=${v}`).join(',') || 'none'}${features}${stuck.length ? ` [${stuck.join(' ')}]` : ''}`);
+      }
+      if (this.tileErrors.length) parts.push(`errors: ${this.tileErrors.splice(0).join(' ; ')}`);
+      const report = parts.join(' | ');
+      if (report === this.lastReport) return;
+      this.lastReport = report;
+      void fetch(`${statusBaseUrl(settings.proxyBaseUrl)}/client-log`, { method: 'POST', body: report, cache: 'no-store' }).catch(() => undefined);
+    } catch (error) {
+      console.warn(`${TAG} Tile report failed`, error);
+    }
+  }
+
+  /**
+   * Tiles that took long to download were first shown as stand-ins built from other zoom levels
+   * (or left empty after a failure). The proxy lists them once the real tile is in; reload those
+   * so the map swaps them in - MapLibre would otherwise keep the stand-in until it drops the tile.
+   */
+  private async refreshReadyTiles(): Promise<void> {
+    const map = this.map;
+    const settings = this.settings;
+    const prepared = this.prepared;
+    if (this.readyBusy || !map || !settings?.enabled || !prepared || !this.onMapKey || !this.store.isProxyReady()) return;
+    this.readyBusy = true;
+    try {
+      const since = this.readySeq ?? 0;
+      const response = await fetch(`${statusBaseUrl(settings.proxyBaseUrl)}/tiles/ready?since=${since}`, { cache: 'no-store' });
+      if (!response.ok) return;
+      const payload = await response.json() as { seq?: number; tiles?: Array<{ name: string; z: number; x: number; y: number }> };
+      if (typeof payload.seq === 'number') {
+        // The proxy restarted (its count went back): start over from its count.
+        this.readySeq = payload.seq < since ? 0 : payload.seq;
+      }
+      const tiles = payload.tiles ?? [];
+      if (!tiles.length || this.map !== map) return;
+
+      const byName = new Map<string, Array<{ x: number; y: number; z: number }>>();
+      for (const tile of tiles) {
+        const list = byName.get(tile.name) ?? [];
+        list.push({ x: tile.x, y: tile.y, z: tile.z });
+        byName.set(tile.name, list);
+      }
+      for (const [id, source] of Object.entries(prepared.sources)) {
+        const url = typeof (source as { url?: unknown }).url === 'string' ? (source as { url: string }).url : '';
+        const name = url.match(TILE_NAME_FROM_URL)?.[1];
+        const list = name ? byName.get(name) : undefined;
+        if (list?.length && map.getSource(id)) reloadTiles(map, id, list);
+      }
+    } catch {
+      // Proxy busy or restarting - try again on the next poll.
+    } finally {
+      this.readyBusy = false;
+    }
   }
 
   private detach(): void {
@@ -516,8 +674,10 @@ export class OrmLayerManager {
     this.handlers = [];
     if (this.checkTimer !== null) window.clearTimeout(this.checkTimer);
     if (this.viewTimer !== null) window.clearTimeout(this.viewTimer);
+    if (this.readyTimer !== null) window.clearInterval(this.readyTimer);
     this.checkTimer = null;
     this.viewTimer = null;
+    this.readyTimer = null;
     this.updateAttribution(false);
   }
 
@@ -618,4 +778,26 @@ export class OrmLayerManager {
 
 export function featureKey(feature: InspectedFeature): string {
   return `${feature.source}|${feature.sourceLayer}|${feature.id}`;
+}
+
+/** Reloads particular tiles of a source (whole source on older MapLibre builds). */
+export function reloadTiles(map: MapLike, sourceId: string, tiles: Array<{ x: number; y: number; z: number }>): void {
+  try {
+    if (typeof map.refreshTiles === 'function') {
+      map.refreshTiles(sourceId, tiles);
+      return;
+    }
+    const style = (map as { style?: { sourceCaches?: Record<string, { reload?: () => void }>; tileManagers?: Record<string, { reload?: () => void }> } }).style;
+    const cache = style?.sourceCaches?.[sourceId] ?? style?.tileManagers?.[sourceId];
+    if (cache?.reload) {
+      cache.reload();
+      map.triggerRepaint?.();
+    }
+  } catch (error) {
+    console.warn(`${TAG} Could not reload tiles of ${sourceId}`, error);
+  }
+}
+
+function shortSource(id: string): string {
+  return id.replace(/^.*:src:/, '').split(',')[0];
 }

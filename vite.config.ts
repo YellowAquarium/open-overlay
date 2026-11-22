@@ -34,6 +34,8 @@ export default defineConfig({
       targets: [
         { src: 'manifest.json', dest: '.' },
         { src: 'proxy.js', dest: '.' },
+        { src: 'disk-cache.js', dest: '.' },
+        { src: 'mlt-convert.js', dest: '.' },
         { src: '.env.example', dest: '.' },
         { src: 'start-proxy-windows.cmd', dest: '.' },
         { src: 'start-proxy-macos.command', dest: '.' },

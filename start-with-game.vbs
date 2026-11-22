@@ -28,7 +28,9 @@ If WScript.Arguments.Count > 0 Then
   Next
   ' Start the proxy first (hidden). It watches for the Subway Builder process and stops when it is gone.
   If nodeOk Then
-    shell.Run "node " & proxy & " --with-game", 0, False
+    ' Tell the proxy which program the game is (Steam passes its full path first), so it can
+    ' tell exactly when the game has closed.
+    shell.Run "node " & proxy & " --with-game --game-exe """ & WScript.Arguments(0) & """", 0, False
   Else
     MsgBox "Node.js was not found, so the Open Overlay proxy could not start." & vbCrLf & _
       "Install Node.js from https://nodejs.org/ - the game will still run without the overlay.", 48, "Open Overlay"

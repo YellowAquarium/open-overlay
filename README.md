@@ -57,10 +57,12 @@ Then just press *Play* in Steam as usual. (Use *Open mods folder* in the mod pan
 background and then launches the game through Steam. If you don't have the Steam version, set
 `SUBWAY_BUILDER_EXE` in `.env` to the game's path. You can put a shortcut to it on your desktop.
 
-How it knows the game closed: it watches for a running Subway Builder process (on macOS/Linux
-with the Steam launch option it watches the exact game process). It waits briefly in case the
-game restarts itself (e.g. after enabling mods), and never stops while the game is still using it.
-Without a visible window, the proxy's messages go to `logs/proxy.log` in the mod folder.
+How it knows the game closed: the Steam launcher tells the proxy the game's program
+(`game.exe` in the Subway Builder folder), and the proxy stops shortly after that program exits.
+When started by double-click, the proxy finds the program by its install folder. As a backup,
+the mod sends a "still here" signal every 15 seconds; if the program can't be seen, the proxy
+only stops after 10 minutes without that signal (the game can freeze for minutes while loading a
+big city). It also waits a little if the game is restarting itself (e.g. after enabling mods).
 
 ### Start the proxy by hand
 
@@ -73,6 +75,17 @@ Double-click the launcher for your OS and **leave the window open while you play
 On macOS/Linux you may first need `chmod +x` on the launcher. You can also run `node proxy.js` from a terminal.
 
 The proxy listens on `http://127.0.0.1:8788` (Orbital Surveyor uses 8787, so both mods can run side by side).
+It also answers the mod's status checks on the next port, 8789, so slow tile downloads can't make a
+busy proxy look like it has stopped.
+
+## Keyboard shortcuts
+
+| Keys | Action |
+| --- | --- |
+| **Ctrl+T** | Railway overlay on/off |
+| **Ctrl+M** | Satellite imagery on/off |
+
+They work while a game is open and are ignored while you're typing in a text box.
 
 ## Using the panel
 
@@ -101,10 +114,15 @@ Copy `.env.example` to `.env` next to `proxy.js` and restart the proxy:
 | `ORM_CACHE_MB` | `256` | In-memory cache size |
 | `ORM_MAX_CONCURRENT` | `8` | Maximum parallel requests to openrailwaymap.app |
 | `ORM_UPSTREAM` | `https://openrailwaymap.app` | Use your own OpenRailwayMap-vector server instead |
-| `ORM_CONTACT` | `mahyeung84@gmail.com` | Contact address in the User-Agent (asked for by OpenStreetMap's tile policy) |
+| `ORM_CONTACT` | – | Contact (email or web page) added to the User-Agent, as OpenStreetMap's tile policy asks |
 | `ORM_USER_AGENT` | mod name + version + contact | Full User-Agent override |
 | `ORM_REFERER` | this mod's GitHub page | Referer sent to openrailwaymap.app (required by its server — see below) |
 | `SATELLITE_CACHE_MB` | `256` | In-memory imagery cache size |
+| `ORM_DISK_CACHE_GB` | `25` | Disk space for saved railway data (0 turns the disk cache off) |
+| `ORM_DISK_REFRESH_DAYS` | `7` | Saved railway tiles are re-checked online after this many days |
+| `GOOGLE_KEYLESS_DISK_CACHE_GB` | `50` | Disk space for saved keyless Google tiles (0 turns it off) |
+| `GOOGLE_KEYLESS_REFRESH_DAYS` | `0` | Re-download saved Google tiles after this many days (0 = never) |
+| `OPEN_OVERLAY_CACHE_DIR` | see below | Where the disk cache lives |
 | `GOOGLE_MAPS_API_KEY` | – | Enables Google satellite through the official Map Tiles API |
 
 Proxy endpoints: `GET /health`, `/sat/:provider/:z/:x/:y`, `/orm/style.json`, `/orm/tilejson/:source`,
@@ -151,6 +169,49 @@ beyond that Google charges about **US$0.60 per 1,000 tiles**. Each project is al
 **15,000 tile requests per day**. One screen of imagery is roughly 20–40 tiles, so panning a
 lot at high zoom uses them quickly. The proxy reuses tiles for as long as Google allows, which
 helps. Check Google's pricing page for current numbers.
+
+## Tile format
+
+Since November 2026 openrailwaymap.app serves its data mainly in the newer MapLibre Tile (MLT)
+format, which the game's map engine can't read. The proxy takes the tiles the server already has
+cached (so they load as fast as on the website) and converts MLT tiles to the classic vector-tile
+format itself (`mlt-convert.js`). Only if a tile can't be converted does it ask the server to build
+a fresh classic copy, which is slower.
+
+## Filling gaps while tiles stream
+
+If a railway tile takes longer than 0.8 s (`STANDIN_AFTER_MS`), the proxy answers straight away
+with a stand-in built from tiles it already has for nearby zoom levels: the four (or sixteen)
+more detailed tiles beneath it after zooming out, or the nearest saved coarser tile after zooming
+in. The mod then swaps in the real tile as soon as it has arrived (it checks every 2 s). Tiles
+that fail are no longer left as permanent holes - they're tried again after 30 s. Requests for
+the view on screen now go to the front of the download queue, ahead of views you've already left.
+
+## Disk cache
+
+Tiles you've looked at are saved to disk, so they load instantly next time and still show
+when openrailwaymap.app or Google can't be reached:
+
+- **Railway data** (OpenRailwayMap tiles, style, symbols): up to **25 GB**. Saved tiles are used
+  straight away; after 7 days they are re-checked online the next time you look at them (the
+  railway data upstream changes daily). If the server can't be reached, the saved copy is shown.
+- **Google imagery (keyless options):** up to **50 GB**, kept until space is needed.
+- The official Google API option and OpenStreetMap tiles are **not** saved to disk.
+
+When a cache is full, the tiles you haven't looked at for the longest are deleted first. The
+proxy also stops saving if the drive has less than 2 GB free. The *Proxy* section of the panel
+shows how much is saved, has a *Clear* button for each cache, and an *Open cache folder* link.
+
+The cache is kept outside the game's mods folder, so updating the mod doesn't delete it:
+
+- Windows: `%LOCALAPPDATA%\OpenOverlay\cache`
+- macOS: `~/Library/Caches/OpenOverlay`
+- Linux: `~/.cache/open-overlay`
+
+To keep it somewhere else, set `OPEN_OVERLAY_CACHE_DIR` in `.env`.
+
+Storing Google's tiles goes against Google's terms, like the keyless options themselves; this
+mod is for personal use.
 
 ## Fair use
 
@@ -199,7 +260,10 @@ npm run proxy      # run the proxy from source
 ## Troubleshooting
 
 - **Panel says "Proxy not running"** – start the launcher and press *Refresh*. With the auto-start launchers, check `logs/proxy.log`; the most common cause is Node.js not being installed.
-- **Proxy stops too early or doesn't stop** – it recognises the game by a process name containing "Subway Builder" or "metro-maker". If your copy is named differently, set `GAME_PROCESS_MATCH` in `.env`.
+- **Overlay disappears and comes back** – usually openrailwaymap.app being slow (`status=408` in the log), not the proxy stopping. Already-loaded tiles now stay on screen, and the panel only reports the proxy as down after it has missed three checks in a row.
+- **After updating the mod** – a newer auto-started proxy asks an older one still running to stop and takes over. Proxies older than 1.2.2 can't be asked, so end any leftover `node.exe` in Task Manager once (or restart the PC).
+- **Proxy stopped unexpectedly** – check `logs/proxy.log` in the mod folder: it records why it stopped, including any unexpected error.
+- **Proxy stops too early or doesn't stop** – `logs/proxy.log` says which program it is watching ("Watching the game process ..."). If the game is installed in a folder not named "Subway Builder", set `GAME_FOLDER_MATCH` in `.env` to that folder's name.
 - **Port already in use** – another copy of the proxy is running, or set `PROXY_PORT` in `.env` and update the address in the panel.
 - **Overlay on but nothing shows** – zoom in; check the proxy window for upstream errors; openrailwaymap.app may be busy (failed tiles are retried after 30 s and stale cached tiles are reused).
 - **Proxy window shows `status=403`** – openrailwaymap.app refused the requests. Make sure you are running the proxy from this version (it prints the Referer it sends when it starts), restart it, then press *Reload overlay*.

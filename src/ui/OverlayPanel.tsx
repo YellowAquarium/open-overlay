@@ -86,6 +86,19 @@ export function OverlayPanel({ store, layers }: Props) {
           <span>To have it start and stop with the game automatically, add the start-with-game launcher to Subway Builder's Steam launch options (see the README). Or double-click start-with-game in this mod's folder, then press Refresh.</span>
           <div className="orm-row" style={{ justifyContent: 'flex-start', gap: 12 }}>
             <button type="button" className="orm-link" onClick={() => openModsFolder()}>Open mods folder</button>
+            <button
+              type="button"
+              className="orm-link"
+              disabled={!snapshot.proxyReady}
+              title={snapshot.proxyHealth?.diskCacheDir}
+              onClick={() => {
+                void store.openCacheFolder().then((ok) => {
+                  if (!ok) api.ui.showNotification('Could not open the cache folder (is the proxy running?).', 'warning');
+                });
+              }}
+            >
+              Open cache folder
+            </button>
             <button type="button" className="orm-link" onClick={() => void store.refreshProxyHealth()}>Refresh</button>
           </div>
         </div>
@@ -317,10 +330,24 @@ export function OverlayPanel({ store, layers }: Props) {
           ) : snapshot.proxyHealth?.upstreamLastFailure ? (
             <span className="orm-muted">Last upstream problem: {snapshot.proxyHealth.upstreamLastFailure}</span>
           ) : null}
+          <DiskCacheRows snapshot={snapshot} store={store} />
           <div className="orm-row" style={{ justifyContent: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
             <button type="button" className="orm-link" onClick={() => void store.refreshProxyHealth()}>Refresh status</button>
             <button type="button" className="orm-link" onClick={() => layers.reload()}>Reload overlay</button>
             <button type="button" className="orm-link" onClick={() => openModsFolder()}>Open mods folder</button>
+            <button
+              type="button"
+              className="orm-link"
+              disabled={!snapshot.proxyReady}
+              title={snapshot.proxyHealth?.diskCacheDir}
+              onClick={() => {
+                void store.openCacheFolder().then((ok) => {
+                  if (!ok) api.ui.showNotification('Could not open the cache folder (is the proxy running?).', 'warning');
+                });
+              }}
+            >
+              Open cache folder
+            </button>
             <button type="button" className="orm-link" onClick={() => openExternal(README_URL)}>openrailwaymap.app</button>
           </div>
         </div>
@@ -529,6 +556,56 @@ function describeStatus(snapshot: OverlaySnapshot): string {
   if (!snapshot.settings.enabled) return snapshot.proxyReady ? 'Off · proxy connected' : 'Off · proxy not connected';
   if (!snapshot.proxyReady) return 'Waiting for proxy';
   return snapshot.layerStatus.message;
+}
+
+const DISK_CACHE_LABELS = [
+  { id: 'openrailwaymap', label: 'Railway data' },
+  { id: 'google-keyless', label: 'Google imagery (keyless)' },
+] as const;
+
+function DiskCacheRows({ snapshot, store }: { snapshot: OverlaySnapshot; store: OverlayStore }) {
+  const disk = snapshot.proxyHealth?.diskCache;
+  if (!disk) return null;
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="orm-label">Saved on disk</span>
+      {snapshot.proxyHealth?.diskCacheDir ? (
+        <span className="orm-muted" style={{ wordBreak: 'break-all' }}>{snapshot.proxyHealth.diskCacheDir}</span>
+      ) : null}
+      {DISK_CACHE_LABELS.map(({ id, label }) => {
+        const stats = disk[id];
+        if (!stats?.enabled) return null;
+        const status = stats.clearing
+          ? 'clearing…'
+          : !stats.ready
+            ? 'counting…'
+            : `${formatBytes(stats.bytes)} of ${formatBytes(stats.maxBytes)}${stats.diskFull ? ' · paused, drive nearly full' : ''}`;
+        return (
+          <div key={id} className="orm-row">
+            <span className="orm-muted">{label}: {status}</span>
+            <button
+              type="button"
+              className="orm-link"
+              disabled={stats.clearing}
+              onClick={() => {
+                if (window.confirm(`Delete all saved ${label.toLowerCase()} (${formatBytes(stats.bytes)})? It will be downloaded again as you look around.`)) {
+                  void store.clearDiskCache(id);
+                }
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)} MB`;
+  return `${Math.round(bytes / 1024)} KB`;
 }
 
 function formatCache(snapshot: OverlaySnapshot): string {

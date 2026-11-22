@@ -95,6 +95,11 @@ export class SatelliteLayerManager {
     if (!map || !settings) return;
     const provider = this.activeProvider();
 
+    if (!provider && settings.satellite.enabled && !this.store.isProxyReady() && map.getLayer(LAYER_ID)) {
+      // Proxy hiccup: keep the imagery that's already showing.
+      return;
+    }
+
     if (!provider) {
       this.remove();
       this.restoreBaseMap();

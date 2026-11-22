@@ -19,7 +19,20 @@ export type ProxyHealth = {
   referer?: string;
   cache?: { entries: number; bytes: number; maxBytes: number };
   satelliteCache?: { entries: number; bytes: number; maxBytes: number };
+  diskCache?: Record<string, DiskCacheStats>;
+  diskCacheDir?: string;
   satelliteProviders?: SatelliteProvider[];
+};
+
+export type DiskCacheStats = {
+  dir: string;
+  bytes: number;
+  files: number;
+  maxBytes: number;
+  ready: boolean;
+  clearing: boolean;
+  diskFull: boolean;
+  enabled: boolean;
 };
 
 export type SatelliteProvider = {
@@ -101,6 +114,7 @@ export class OverlayStore {
   }
 
   destroy(): void {
+    if (this.quickRetryTimer !== null) window.clearTimeout(this.quickRetryTimer);
     if (this.healthTimer !== null) window.clearInterval(this.healthTimer);
     this.healthTimer = null;
     this.listeners.clear();
@@ -178,6 +192,28 @@ export class OverlayStore {
     this.emit();
   }
 
+  /** Empties one of the proxy's disk caches ("openrailwaymap" or "google-keyless"). */
+  async clearDiskCache(id: 'openrailwaymap' | 'google-keyless'): Promise<boolean> {
+    try {
+      const response = await fetch(`${this.settings.proxyBaseUrl}/cache/${id}`, { method: 'DELETE' });
+      return response.ok;
+    } catch {
+      return false;
+    } finally {
+      window.setTimeout(() => void this.refreshProxyHealth(), 1000);
+    }
+  }
+
+  /** Asks the proxy to open the cache folder in the file explorer. */
+  async openCacheFolder(): Promise<boolean> {
+    try {
+      const response = await fetch(`${this.settings.proxyBaseUrl}/cache/open`, { method: 'POST' });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
   async refreshProxyHealth(): Promise<void> {
     if (this.healthPromise) return this.healthPromise;
     this.healthPromise = this.fetchHealth().finally(() => {
@@ -187,29 +223,39 @@ export class OverlayStore {
   }
 
   private async fetchHealth(): Promise<void> {
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 3000);
     try {
-      const response = await fetch(`${this.settings.proxyBaseUrl}/health`, { signal: controller.signal, cache: 'no-store' });
-      const payload = await response.json() as ProxyHealth;
+      // Status port first (not shared with tile downloads), then the main port (older proxies).
+      const { payload, ok, status } = await fetchHealthFrom([statusBaseUrl(this.settings.proxyBaseUrl), this.settings.proxyBaseUrl]);
       if (payload.service && payload.service !== 'open-overlay-proxy') {
         throw new Error('Another proxy is running on this port');
       }
       this.proxyHealth = payload;
-      this.proxyError = response.ok ? null : `Proxy returned ${response.status}`;
+      this.proxyError = ok ? null : `Proxy returned ${status}`;
       this.healthFailures = 0;
+      this.scheduleQuickRetry(false);
     } catch (error) {
       this.healthFailures += 1;
-      // Ignore a single blip; report after two failures in a row (or straight away if never connected).
-      if (this.healthFailures >= 2 || !this.proxyHealth) {
+      // A slow or missed answer is usually a busy moment, not a stopped proxy: only report the
+      // proxy as down after 3 failed checks in a row (about 15 s), retrying every 5 s meanwhile.
+      if (this.healthFailures >= 3) {
         this.proxyHealth = null;
         this.proxyError = error instanceof Error
-          ? (error.name === 'AbortError' ? 'Proxy not responding' : error.message === 'Failed to fetch' ? 'Proxy not running' : error.message)
+          ? (error.name === 'AbortError' || error.name === 'TimeoutError' ? 'Proxy not responding' : error.message === 'Failed to fetch' ? 'Proxy not running' : error.message)
           : 'Proxy unavailable';
       }
+      this.scheduleQuickRetry(true);
     } finally {
-      window.clearTimeout(timeout);
       this.emit();
+    }
+  }
+
+  private quickRetryTimer: number | null = null;
+
+  private scheduleQuickRetry(enabled: boolean): void {
+    if (this.quickRetryTimer !== null) window.clearTimeout(this.quickRetryTimer);
+    this.quickRetryTimer = null;
+    if (enabled && this.healthFailures < 12) {
+      this.quickRetryTimer = window.setTimeout(() => void this.refreshProxyHealth(), 5000);
     }
   }
 
@@ -242,4 +288,34 @@ export class OverlayStore {
     this.snapshot = null;
     for (const listener of this.listeners) listener();
   }
+}
+
+/** The proxy's status port (main port + 1), used for health checks and the heartbeat. */
+export function statusBaseUrl(proxyBaseUrl: string): string {
+  try {
+    const url = new URL(proxyBaseUrl);
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    url.port = String(port + 1);
+    return url.origin;
+  } catch {
+    return proxyBaseUrl;
+  }
+}
+
+async function fetchHealthFrom(bases: string[]): Promise<{ payload: ProxyHealth; ok: boolean; status: number }> {
+  let lastError: unknown = null;
+  for (const base of bases) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch(`${base}/health`, { signal: controller.signal, cache: 'no-store' });
+      const payload = await response.json() as ProxyHealth;
+      return { payload, ok: response.ok, status: response.status };
+    } catch (error) {
+      lastError = error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+  throw lastError ?? new Error('Proxy unavailable');
 }

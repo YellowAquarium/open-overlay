@@ -140,7 +140,10 @@ test('bakes state into layers when the game MapLibre lacks global state', async 
   await settle();
   const line = map.layers.find((l) => l.id === 'open-overlay:line') as unknown as { layout: Record<string, unknown> };
   assert.deepEqual(line.layout.visibility, ['case', ['==', 'usage', 'usage'], 'visible', 'none']);
-  assert.equal(map.layers[map.layers.length - 1].id, 'open-overlay:route', 'no anchor found -> on top');
+  // Above tracks: directly above the game's top track layer.
+  const ids = () => map.layers.map((l) => l.id);
+  assert.equal(ids()[ids().indexOf('construction-tracks-base') + 1], 'open-overlay:line');
+  assert.equal(ids()[ids().indexOf('open-overlay:route') + 1], 'labels');
   assert.equal(store.getSnapshot().layerStatus.globalStateMode, 'baked');
 
   store.updateSettings({ mapState: { ...store.getSettings().mapState, tracks: 'gauge' } });
@@ -213,4 +216,29 @@ test('retired imagery choices fall back to the default', async () => {
   assert.equal(normalizeSatellite({ provider: 'eox-s2' }).provider, 'google-sat');
   assert.equal(normalizeSatellite({ provider: 'osm' }).provider, 'osm');
   assert.equal(normalizeSatellite({ provider: 'maptiler' }).provider, 'google-sat');
+});
+
+test('above-tracks overlay stays on top when the build menu adds blueprint track layers', async () => {
+  const { store, manager, map } = await setup(true);
+  store.updateSettings({ enabled: true, aboveTracks: true });
+  manager.setSettings(store.getSettings());
+  await settle();
+  // Build mode: the game adds its preview tracks above everything else.
+  map.layers.push({ id: 'blueprint-tracks', type: 'line' }, { id: 'blueprint-tracks-casing', type: 'line' });
+  map.listeners.styledata.forEach((fn) => fn());
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const ids = map.layers.map((l) => l.id);
+  const firstOurs = ids.findIndex((id) => id.startsWith('open-overlay:'));
+  assert.ok(firstOurs > ids.indexOf('blueprint-tracks-casing'), ids.join(', '));
+  manager.destroy();
+});
+
+test('reloadTiles uses refreshTiles when the map has it, else reloads the source', async () => {
+  const { reloadTiles } = await import('../src/OrmLayerManager');
+  const calls: unknown[] = [];
+  reloadTiles({ refreshTiles: (id: string, tiles: unknown) => calls.push([id, tiles]) } as any, 'src', [{ x: 1, y: 2, z: 3 }]);
+  assert.deepEqual(calls, [['src', [{ x: 1, y: 2, z: 3 }]]]);
+  let reloaded = 0;
+  reloadTiles({ style: { sourceCaches: { src: { reload: () => { reloaded += 1; } } } } } as any, 'src', [{ x: 1, y: 2, z: 3 }]);
+  assert.equal(reloaded, 1);
 });

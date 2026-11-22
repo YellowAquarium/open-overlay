@@ -1,6 +1,6 @@
-import { MOD_ID, MOD_NAME, MOD_VERSION, TAG, type OverlaySettings } from './config';
+import { MOD_ID, MOD_NAME, MOD_VERSION, TAG, normalizeSettings, type OverlaySettings } from './config';
 import { OrmLayerManager, type MapLike } from './OrmLayerManager';
-import { OverlayStore, type ProxyHealth } from './store';
+import { OverlayStore, statusBaseUrl, type ProxyHealth } from './store';
 import { SatelliteLayerManager } from './SatelliteLayerManager';
 import { MapAttribution } from './attribution';
 import { OverlayPanel } from './ui/OverlayPanel';
@@ -91,6 +91,29 @@ class OpenOverlayMod {
     }
   }
 
+  /**
+   * Keyboard shortcuts while in a game: Ctrl+T toggles the railway overlay, Ctrl+M the
+   * satellite imagery. Ignored while typing in a text field.
+   */
+  handleKey(event: KeyboardEvent): void {
+    const store = this.store;
+    if (!store || !event.ctrlKey || event.altKey || event.shiftKey || event.metaKey || event.repeat) return;
+    const key = event.key.toLowerCase();
+    if (key !== 't' && key !== 'm') return;
+    const target = event.target as HTMLElement | null;
+    if (target && (target.isContentEditable || /^(input|textarea|select)$/i.test(target.tagName))) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const settings = store.getSettings();
+    if (key === 't') {
+      store.updateSettings({ enabled: !settings.enabled });
+      api.ui.showNotification(`Railway overlay ${settings.enabled ? 'off' : 'on'} (Ctrl+T)`, 'info');
+    } else {
+      store.updateSettings({ satellite: { ...settings.satellite, enabled: !settings.satellite.enabled } });
+      api.ui.showNotification(`Satellite imagery ${settings.satellite.enabled ? 'off' : 'on'} (Ctrl+M)`, 'info');
+    }
+  }
+
   onGameEnd(): void {
     this.unsubscribe?.();
     this.unsubscribe = null;
@@ -126,4 +149,29 @@ if (!api) {
     });
   });
   api.hooks.onGameEnd(() => mod.onGameEnd());
+  // Capture phase, so the shortcuts work even when the map has keyboard focus.
+  window.addEventListener('keydown', (event) => mod.handleKey(event), true);
+  startHeartbeat();
+}
+
+/**
+ * Tells the proxy every 15 s that the game is still open - from the moment the game starts,
+ * including the main menu - so an auto-started proxy knows not to shut down.
+ */
+function startHeartbeat(): void {
+  const beat = () => {
+    let base = normalizeSettings({}).proxyBaseUrl;
+    try {
+      const saved = window.localStorage.getItem(`${MOD_ID}:settings`);
+      if (saved) base = normalizeSettings(JSON.parse(saved)).proxyBaseUrl;
+    } catch {
+      // use the default address
+    }
+    // Status port first (not shared with tile downloads); main port for older proxies.
+    void fetch(`${statusBaseUrl(base)}/heartbeat`, { cache: 'no-store' })
+      .catch(() => fetch(`${base}/heartbeat`, { cache: 'no-store' }))
+      .catch(() => undefined);
+  };
+  beat();
+  window.setInterval(beat, 15000);
 }

@@ -15,6 +15,8 @@ import fs from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DiskCache, defaultCacheDir, formatBytes } from './disk-cache.js';
+import { mltToMvt, looksLikeMvt, composeTile, summarizeMvt } from './mlt-convert.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 loadDotEnv(path.join(__dirname, '.env'));
@@ -31,32 +33,65 @@ const LAUNCH_GAME = CLI_ARGS.includes('--launch-game');
 const FOLLOW_GAME = CLI_ARGS.includes('--with-game') || LAUNCH_GAME || GAME_PID !== null;
 const STEAM_APP_ID = '4039140';
 const GAME_PROCESS_MATCH = new RegExp(process.env.GAME_PROCESS_MATCH || 'subway.?builder|metro.?maker', 'i');
+// The game's program file name, when known: passed by the launcher (--game-exe), taken from
+// SUBWAY_BUILDER_EXE, or discovered from the install folder (see discoverGameExe).
+let gameExeName = exeNameOf(parseStringArg(CLI_ARGS, '--game-exe') || process.env.SUBWAY_BUILDER_EXE || '');
+// Folder name that identifies the game install when looking processes up by path.
+const GAME_FOLDER_MATCH = process.env.GAME_FOLDER_MATCH || 'Subway Builder';
 const GAME_CHECK_INTERVAL_MS = envMs('GAME_CHECK_INTERVAL_MS', 5000);
 const GAME_START_TIMEOUT_MS = envMs('GAME_START_TIMEOUT_MS', 10 * 60 * 1000); // time for Steam / updates to start the game
 const GAME_RESTART_GRACE_MS = envMs('GAME_RESTART_GRACE_MS', 30000);          // the game may relaunch itself (mod changes)
-const GAME_QUIET_MS = envMs('GAME_QUIET_MS', 60000);                          // never stop while the game is still talking to us
+// The mod's heartbeat counts as "game open" for this long. Generous, because the game can freeze
+// its scripts for minutes while loading a big city.
+const GAME_QUIET_MS = envMs('GAME_QUIET_MS', 10 * 60 * 1000);
 const IDLE_FALLBACK_MS = envMs('IDLE_FALLBACK_MS', 30 * 60 * 1000);           // if process detection is unavailable
 const LOG_PATH = path.join(__dirname, 'logs', 'proxy.log');
 const LOG_MAX_BYTES = 1024 * 1024;
+// Diagnostics: one line per railway tile served, plus the mod's reports of what the map did with them.
+const TILE_LOG_PATH = path.join(__dirname, 'logs', 'tiles.log');
+const TILE_LOG_MAX_BYTES = 8 * 1024 * 1024;
+const TILE_LOG = process.env.TILE_LOG !== '0';
+// Bumped when the tiles the proxy sends change format, so the game's own browser cache can't keep
+// showing tiles from an older version.
+const TILE_URL_VERSION = '3';
 prepareLogFile();
 let lastRequestAt = 0;
 const PORT = Number.parseInt(process.env.PROXY_PORT || '8788', 10);
 const HOST = process.env.PROXY_HOST || '127.0.0.1';
+const STATUS_PORT = Number.parseInt(process.env.PROXY_STATUS_PORT || String(PORT + 1), 10);
 const UPSTREAM = (process.env.ORM_UPSTREAM || 'https://openrailwaymap.app').replace(/\/+$/, '');
 // OpenRailwayMap's usage policy requires an honest User-Agent for non-browser clients.
 // OpenStreetMap's tile policy also asks for a way to contact the app's maintainer.
-const CONTACT = process.env.ORM_CONTACT || 'mahyeung84@gmail.com';
+// Set ORM_CONTACT in .env (e.g. an email address or project page) to include it.
+const CONTACT = process.env.ORM_CONTACT || '';
 const USER_AGENT = process.env.ORM_USER_AGENT ||
-  `SubwayBuilder-OpenOverlay/${VERSION} (Subway Builder game mod; local tile proxy; contact: ${CONTACT})`;
+  `SubwayBuilder-OpenOverlay/${VERSION} (Subway Builder game mod; local tile proxy${CONTACT ? `; contact: ${CONTACT}` : ''})`;
 // openrailwaymap.app rejects tile, TileJSON and sprite requests that carry no Referer (HTTP 403).
 // Its usage policy asks browser-style applications to send a real, non-faked Referer, so this
 // identifies the page where the overlay is published. Change it in .env if you host the mod elsewhere.
 const REFERER = process.env.ORM_REFERER || 'https://github.com/YellowAquarium/open-overlay';
 const CACHE_MB = clampNumber(Number.parseInt(process.env.ORM_CACHE_MB || '256', 10), 16, 4096, 256);
-const MAX_CONCURRENT_UPSTREAM = clampNumber(Number.parseInt(process.env.ORM_MAX_CONCURRENT || '8', 10), 1, 32, 8);
+const MAX_CONCURRENT_UPSTREAM = clampNumber(Number.parseInt(process.env.ORM_MAX_CONCURRENT || '12', 10), 1, 32, 12);
+// How long a tile may take before the game gets a stand-in built from saved tiles of other zoom
+// levels; the real tile replaces it once it arrives (the mod asks the game to reload it).
+const STANDIN_AFTER_MS = envMs('STANDIN_AFTER_MS', 800);
+// --- Disk cache (keeps streamed tiles between sessions) -----------------------
+// Kept outside the game's mods folder (e.g. %LOCALAPPDATA%\OpenOverlay\cache), so the game's mod scan
+// never has to look through it and updating the mod doesn't delete it.
+const DISK_CACHE_DIR = process.env.OPEN_OVERLAY_CACHE_DIR || defaultCacheDir();
+const ORM_DISK_CACHE_GB = envGb('ORM_DISK_CACHE_GB', 25);
+const GOOGLE_KEYLESS_DISK_CACHE_GB = envGb('GOOGLE_KEYLESS_DISK_CACHE_GB', 50);
+// Railway data changes upstream (OpenRailwayMap refreshes roughly daily), so stored tiles are
+// re-checked after this many days; until then, and whenever openrailwaymap.app can't be
+// reached, the stored copy is used.
+const ORM_DISK_REFRESH_DAYS = envDays('ORM_DISK_REFRESH_DAYS', 7);
+// 0 = keep using stored Google tiles until they are evicted to make room.
+const GOOGLE_KEYLESS_REFRESH_DAYS = envDays('GOOGLE_KEYLESS_REFRESH_DAYS', 0);
 const SATELLITE_CACHE_MB = clampNumber(Number.parseInt(process.env.SATELLITE_CACHE_MB || '256', 10), 16, 4096, 256);
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
-const UPSTREAM_TIMEOUT_MS = 30000;
+// Give up on a slow upstream after 25 s (freshly made tiles can take a while on a busy server);
+// a saved copy is served instead when there is one.
+const UPSTREAM_TIMEOUT_MS = 25000;
 
 /**
  * Satellite / base imagery providers. All go through this proxy so the game needs no direct
@@ -74,6 +109,7 @@ const SATELLITE_PROVIDERS = [
     attribution: 'Imagery © Google',
     tileSize: 256,
     maxZoom: 20,
+    keylessGoogle: true,
     url: (z, x, y) => googleWebTileUrl('s', z, x, y),
   },
   {
@@ -82,6 +118,7 @@ const SATELLITE_PROVIDERS = [
     attribution: 'Imagery © Google, map data © Google',
     tileSize: 256,
     maxZoom: 20,
+    keylessGoogle: true,
     url: (z, x, y) => googleWebTileUrl('y', z, x, y),
   },
   {
@@ -147,6 +184,19 @@ const API_QUERY_KEYS = new Set(['q', 'name', 'ref', 'lang', 'limit', 'position']
 const startedAt = Date.now();
 const cache = new LruCache(CACHE_MB * 1024 * 1024);
 const satelliteCache = new LruCache(SATELLITE_CACHE_MB * 1024 * 1024);
+const ormDisk = new DiskCache({
+  dir: path.join(DISK_CACHE_DIR, 'openrailwaymap'),
+  maxBytes: Math.round(ORM_DISK_CACHE_GB * 1024 ** 3),
+  name: 'OpenRailwayMap',
+  log,
+});
+const googleKeylessDisk = new DiskCache({
+  dir: path.join(DISK_CACHE_DIR, 'google-keyless'),
+  maxBytes: Math.round(GOOGLE_KEYLESS_DISK_CACHE_GB * 1024 ** 3),
+  name: 'Google (keyless)',
+  log,
+});
+const DISK_CACHES = { openrailwaymap: ormDisk, 'google-keyless': googleKeylessDisk };
 const inflight = new Map();
 const upstreamQueue = [];
 let upstreamActive = 0;
@@ -154,21 +204,24 @@ const failureCounts = new Map();
 let failureFlushTimer = null;
 const upstreamState = { lastSuccessAt: null, lastFailureAt: null, lastFailure: null, requests: 0 };
 
-const server = http.createServer((request, response) => {
+const requestHandler = (request, response) => {
   handleRequest(request, response).catch((error) => {
     log(`Unhandled error for ${request.url}: ${formatError(error)}`);
     if (!response.headersSent) sendJson(response, 500, { error: 'proxy_error', message: String(error?.message || error) });
     else response.destroy(error);
   });
-});
+};
+const server = http.createServer(requestHandler);
+// A second port just for the mod's status checks and heartbeat. The game allows only 6 open
+// connections per address; when tile downloads are slow they can fill all 6 on the main port,
+// and a status check stuck behind them would wrongly look like "proxy not running".
+const statusServer = http.createServer(requestHandler);
+let takeoverTried = false;
 
 server.on('error', (error) => {
   if (error.code === 'EADDRINUSE') {
     if (FOLLOW_GAME) {
-      // Another proxy is already serving the game; just make sure the game starts.
-      log(`Port ${PORT} is already in use - another proxy is running, so this one is not needed.`);
-      if (LAUNCH_GAME) launchGame();
-      setTimeout(() => process.exit(0), 500);
+      void handlePortTaken();
       return;
     }
     log(`Port ${PORT} is already in use. Is the proxy already running? Set PROXY_PORT in .env to use another port.`);
@@ -178,9 +231,41 @@ server.on('error', (error) => {
   setTimeout(() => process.exit(1), 200);
 });
 
-server.listen(PORT, HOST, () => {
-  log(`Open Overlay proxy v${VERSION} listening at http://${HOST}:${PORT}`);
+statusServer.on('error', (error) => {
+  log(`Status port ${STATUS_PORT} unavailable (${error.code || error.message}); the mod will check the main port instead.`);
+});
+
+/**
+ * Auto-started and the port is taken. If it's an older Open Overlay proxy (e.g. still running
+ * from before an update), ask it to stop and take over; otherwise leave it be.
+ */
+async function handlePortTaken() {
+  try {
+    if (!takeoverTried) {
+      takeoverTried = true;
+      const health = await fetch(`http://${HOST}:${PORT}/health`, { signal: AbortSignal.timeout(3000) }).then((r) => r.json()).catch(() => null);
+      if (health?.service === 'open-overlay-proxy' && health.version !== VERSION) {
+        log(`An older proxy (v${health.version}) is running; asking it to stop so v${VERSION} can take over.`);
+        await fetch(`http://${HOST}:${PORT}/shutdown`, { method: 'POST', signal: AbortSignal.timeout(3000) }).catch(() => null);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        server.listen(PORT, HOST);
+        return;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  // Another (current) proxy is already serving the game; just make sure the game starts.
+  log(`Port ${PORT} is already in use - another proxy is running, so this one is not needed.`);
+  if (LAUNCH_GAME) launchGame();
+  setTimeout(() => process.exit(0), 500);
+}
+
+server.on('listening', () => {
+  statusServer.listen(STATUS_PORT, HOST);
+  log(`Open Overlay proxy v${VERSION} listening at http://${HOST}:${PORT} (status port ${STATUS_PORT})`);
   log(`Streaming from ${UPSTREAM} (cache ${CACHE_MB} MB, ${MAX_CONCURRENT_UPSTREAM} parallel upstream requests, Referer ${REFERER})`);
+  log(`Disk cache in ${DISK_CACHE_DIR}: OpenRailwayMap ${formatBytes(ormDisk.totalBytes)} / ${ORM_DISK_CACHE_GB} GB, Google (keyless) ${formatBytes(googleKeylessDisk.totalBytes)} / ${GOOGLE_KEYLESS_DISK_CACHE_GB} GB`);
   log(`Satellite providers: ${SATELLITE_PROVIDERS.map((p) => `${p.id}${isSatelliteConfigured(p) ? '' : ` (needs ${p.requires})`}`).join(', ')}`);
   if (FOLLOW_GAME) {
     log(GAME_PID !== null
@@ -193,6 +278,8 @@ server.listen(PORT, HOST, () => {
   }
 });
 
+server.listen(PORT, HOST);
+
 // --------------------------------------------------------------------------
 // Following the game's lifetime
 // --------------------------------------------------------------------------
@@ -200,49 +287,48 @@ server.listen(PORT, HOST, () => {
 function startGameWatch() {
   const startedWatchAt = Date.now();
   let pid = GAME_PID;
-  let seenGame = pid !== null;
-  let misses = 0;
-  let graceUntil = 0;
-  let detectionWorks = true;
+  let processSeen = false;
+  let restartGraceUntil = 0;
+  let hintLogged = false;
 
+  // The game counts as open while either
+  //  - a Subway Builder process is visible, or
+  //  - the mod has talked to the proxy recently (it sends a heartbeat every 15 s from the moment
+  //    the game starts, including the main menu).
+  // Only when both have stopped does the proxy shut down.
   const tick = async () => {
     try {
+      const now = Date.now();
       if (pid !== null) {
         if (isPidAlive(pid)) return;
-        // The game process ended. It may be restarting itself (e.g. after enabling mods),
-        // so look for a new Subway Builder process for a short while before stopping.
+        // The game may be restarting itself (e.g. after enabling mods): wait a little.
         log(`Game process ${pid} exited.`);
         pid = null;
-        seenGame = false;
-        graceUntil = Date.now() + GAME_RESTART_GRACE_MS;
-        return;
+        restartGraceUntil = now + GAME_RESTART_GRACE_MS;
       }
 
       const running = await isGameRunning();
-      if (running === null) {
-        detectionWorks = false;
-      } else if (running) {
-        detectionWorks = true;
-        seenGame = true;
-        misses = 0;
+      if (running) {
+        processSeen = true;
         return;
       }
 
-      const now = Date.now();
-      if (!detectionWorks) {
-        // Can't see processes on this system: stop after a long time without game traffic.
-        const lastActivity = Math.max(lastRequestAt, startedWatchAt);
-        if (now - lastActivity > IDLE_FALLBACK_MS) shutdown('no requests from the game for 30 minutes');
+      const heardFromGame = lastRequestAt > 0;
+      const recentlyHeard = heardFromGame && now - lastRequestAt < GAME_QUIET_MS;
+      if (recentlyHeard) {
+        if (!processSeen && !hintLogged) {
+          hintLogged = true;
+          log(running === null
+            ? 'Cannot read the process list here; following the game through the mod\'s heartbeat instead.'
+            : `Could not find the game's process${gameExeName ? ` ("${gameExeName}")` : ''}; following the game through the mod's heartbeat instead.`);
+        }
         return;
       }
-      if (seenGame) {
-        misses += 1;
-        if (misses >= 2) shutdown('Subway Builder closed');
-        return;
-      }
-      if (graceUntil && now > graceUntil && now - lastRequestAt > GAME_QUIET_MS) {
+      if (restartGraceUntil && now < restartGraceUntil) return;
+
+      if (processSeen || heardFromGame || restartGraceUntil) {
         shutdown('Subway Builder closed');
-      } else if (!graceUntil && now - startedWatchAt > GAME_START_TIMEOUT_MS && now - lastRequestAt > GAME_QUIET_MS) {
+      } else if (now - startedWatchAt > GAME_START_TIMEOUT_MS) {
         shutdown('Subway Builder did not start within 10 minutes');
       }
     } catch (error) {
@@ -263,21 +349,67 @@ function isPidAlive(pid) {
   }
 }
 
+let lastDiscoveryAt = 0;
+let loggedGameExe = false;
+
 /** true / false, or null if the process list can't be read on this system. */
-function isGameRunning() {
+async function isGameRunning() {
+  const names = await listProcessNames();
+  if (names === null) return null;
+  const lower = names.map((name) => name.toLowerCase());
+  if (gameExeName && lower.includes(gameExeName)) {
+    if (!loggedGameExe) {
+      loggedGameExe = true;
+      log(`Watching the game process "${gameExeName}".`);
+    }
+    return true;
+  }
+  // Ignore ourselves (node) and the launcher scripts.
+  if (names.some((name) => GAME_PROCESS_MATCH.test(name) && !/^(node|wscript|cscript|cmd|sh|bash)(\.exe)?$/i.test(name))) return true;
+  // Name unknown: look the game up by its install folder (Windows), at most once a minute.
+  if (!gameExeName && process.platform === 'win32' && Date.now() - lastDiscoveryAt > 60000) {
+    lastDiscoveryAt = Date.now();
+    const discovered = await discoverGameExe();
+    if (discovered) {
+      gameExeName = discovered;
+      log(`Found the game running as "${discovered}"; watching that process from now on.`);
+      return true;
+    }
+  }
+  return false;
+}
+
+function listProcessNames() {
   return new Promise((resolve) => {
     const isWindows = process.platform === 'win32';
     const command = isWindows ? 'tasklist' : 'ps';
     const args = isWindows ? ['/fo', 'csv', '/nh'] : ['-A', '-o', 'comm='];
     execFile(command, args, { windowsHide: true, timeout: 10000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => {
       if (error) return resolve(null);
-      const names = String(stdout).split(/\r?\n/).map((line) => (
+      resolve(String(stdout).split(/\r?\n/).map((line) => (
         isWindows ? (line.split('","')[0] || '').replace(/^"/, '') : path.basename(line.trim())
-      ));
-      // Ignore ourselves (node) and the launcher scripts.
-      resolve(names.some((name) => GAME_PROCESS_MATCH.test(name) && !/^(node|wscript|cscript|cmd|sh|bash)(\.exe)?$/i.test(name)));
+      )).filter(Boolean));
     });
   });
+}
+
+/** Windows: finds a running program inside a "...\\Subway Builder\\..." folder and returns its file name. */
+function discoverGameExe() {
+  return new Promise((resolve) => {
+    const folder = GAME_FOLDER_MATCH.replace(/'/g, "''");
+    const script = `Get-Process | Where-Object { $_.Path -like '*\\${folder}\\*' } | Select-Object -First 1 -ExpandProperty Path`;
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 20000 }, (error, stdout) => {
+      if (error) return resolve(null);
+      const found = String(stdout).trim().split(/\r?\n/)[0];
+      resolve(found ? exeNameOf(found) : null);
+    });
+  });
+}
+
+function exeNameOf(file) {
+  const trimmed = String(file || '').trim().replace(/^"|"$/g, '');
+  if (!trimmed) return '';
+  return trimmed.split(/[\\/]/).pop().toLowerCase();
 }
 
 function launchGame() {
@@ -302,15 +434,72 @@ function launchGame() {
   }
 }
 
+/** Only the game (file:// pages send Origin "null") or local tools - not websites in a browser. */
+function isGameOrigin(request) {
+  const origin = String(request.headers.origin || '');
+  return !origin || origin === 'null' || origin.startsWith('file://');
+}
+
+function openFolder(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const [command, args] = process.platform === 'win32'
+      ? ['explorer', [dir]]
+      : [process.platform === 'darwin' ? 'open' : 'xdg-open', [dir]];
+    spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+  } catch (error) {
+    log(`Could not open ${dir}: ${formatError(error)}`);
+  }
+}
+
+// Log unexpected errors instead of letting them silently end the proxy.
+process.on('uncaughtException', (error) => {
+  log(`Unexpected error (proxy keeps running): ${error?.stack || formatError(error)}`);
+});
+process.on('unhandledRejection', (reason) => {
+  log(`Unexpected rejected promise (proxy keeps running): ${reason?.stack || formatError(reason)}`);
+});
+process.on('exit', (code) => {
+  if (code !== 0) log(`Proxy exiting with code ${code}.`);
+});
+
+function closeDiskCaches() {
+  for (const disk of Object.values(DISK_CACHES)) disk.close();
+}
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    closeDiskCaches();
+    process.exit(0);
+  });
+}
+
 function shutdown(reason) {
   log(`Stopping: ${reason}.`);
+  closeDiskCaches();
   server.close();
+  statusServer.close();
   setTimeout(() => process.exit(0), 300).unref?.();
+}
+
+function envGb(name, fallback) {
+  const value = Number.parseFloat(process.env[name] || '');
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function envDays(name, fallback) {
+  const value = Number.parseFloat(process.env[name] || '');
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function envMs(name, fallback) {
   const value = Number.parseInt(process.env[name] || '', 10);
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function parseStringArg(args, name) {
+  const index = args.indexOf(name);
+  return index >= 0 && typeof args[index + 1] === 'string' ? args[index + 1] : '';
 }
 
 function parsePidArg(args) {
@@ -323,7 +512,7 @@ function parsePidArg(args) {
 async function handleRequest(request, response) {
   lastRequestAt = Date.now();
   response.setHeader('Access-Control-Allow-Origin', '*');
-  response.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (request.method === 'OPTIONS') {
@@ -331,6 +520,63 @@ async function handleRequest(request, response) {
     response.end();
     return;
   }
+  if (request.method === 'POST' && request.url === '/shutdown') {
+    // Lets a newer version of the proxy take over (see handlePortTaken).
+    if (!isGameOrigin(request)) {
+      sendJson(response, 403, { error: 'forbidden_origin' });
+      return;
+    }
+    sendJson(response, 202, { ok: true });
+    shutdown('a newer version of the proxy is taking over');
+    return;
+  }
+
+  if (request.url === '/heartbeat') {
+    // Sent by the mod every 15 s while the game is open (see startGameWatch).
+    response.writeHead(204, { 'cache-control': 'no-store' });
+    response.end();
+    return;
+  }
+
+  if (request.method === 'POST' && request.url === '/client-log') {
+    // The mod's report of what the game's map did with the railway tiles (diagnostics).
+    if (!isGameOrigin(request)) {
+      sendJson(response, 403, { error: 'forbidden_origin' });
+      return;
+    }
+    const text = await readText(request, 64 * 1024);
+    tileStats.clientReports += 1;
+    if (text) tileLog(`game ${text.replace(/[\r\n]+/g, ' | ')}`);
+    response.writeHead(204, { 'cache-control': 'no-store' });
+    response.end();
+    return;
+  }
+
+  if (request.method === 'POST' && request.url === '/cache/open') {
+    if (!isGameOrigin(request)) {
+      sendJson(response, 403, { error: 'forbidden_origin' });
+      return;
+    }
+    openFolder(DISK_CACHE_DIR);
+    sendJson(response, 202, { ok: true, dir: DISK_CACHE_DIR });
+    return;
+  }
+
+  const clearMatch = request.method === 'DELETE' && (request.url || '').match(/^\/cache\/(openrailwaymap|google-keyless|all)$/);
+  if (clearMatch) {
+    if (!isGameOrigin(request)) {
+      sendJson(response, 403, { error: 'forbidden_origin' });
+      return;
+    }
+    const targets = clearMatch[1] === 'all' ? Object.values(DISK_CACHES) : [DISK_CACHES[clearMatch[1]]];
+    for (const disk of targets) void disk.clear();
+    // Drop in-memory copies too so cleared tiles are fetched fresh.
+    if (clearMatch[1] !== 'google-keyless') cache.clear();
+    if (clearMatch[1] !== 'openrailwaymap') satelliteCache.clear();
+    sendJson(response, 202, { ok: true, clearing: clearMatch[1] });
+    return;
+  }
+
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     sendJson(response, 405, { error: 'method_not_allowed' });
     return;
@@ -346,7 +592,7 @@ async function handleRequest(request, response) {
   }
 
   if (pathname === '/orm/style.json') {
-    const result = await fetchCached(`${UPSTREAM}/style.json`, TTL.style, 'style');
+    const result = await fetchCached(`${UPSTREAM}/style.json`, TTL.style, 'style', { disk: ormDisk, diskFreshMs: TTL.style });
     if (!isOk(result)) return sendUpstreamError(response, result, 'style');
     let style;
     try {
@@ -364,7 +610,7 @@ async function handleRequest(request, response) {
     if (!TILE_SOURCE_NAME.test(name)) return sendJson(response, 400, { error: 'invalid_source' });
     const lang = sanitizeLang(url.searchParams.get('lang'));
     const upstreamUrl = `${UPSTREAM}/${name}${lang ? `?lang=${encodeURIComponent(lang)}` : ''}`;
-    const result = await fetchCached(upstreamUrl, TTL.tilejson, 'tilejson');
+    const result = await fetchCached(upstreamUrl, TTL.tilejson, 'tilejson', { disk: ormDisk, diskFreshMs: TTL.tilejson });
     if (!isOk(result)) return sendUpstreamError(response, result, 'tilejson');
     let tileJson;
     try {
@@ -384,22 +630,105 @@ async function handleRequest(request, response) {
     }
     const lang = sanitizeLang(url.searchParams.get('lang'));
     const upstreamUrl = `${UPSTREAM}/${name}/${z}/${x}/${y}${lang ? `?lang=${encodeURIComponent(lang)}` : ''}`;
-    const result = await fetchCached(upstreamUrl, TTL.tile, `tiles:${name}`);
+    // The game reads classic Mapbox Vector Tiles (MVT). Since November 2026 openrailwaymap.app
+    // serves the newer MapLibre Tile (MLT) format to its website and caches one copy per tile
+    // address - usually MLT. The proxy takes whatever is cached (fast) and converts MLT to MVT
+    // itself. Only if a conversion fails does it ask for a freshly made MVT copy ("mvt=1", which
+    // the server ignores but caches separately - slow, as the tile is built from scratch).
+    const tileOptions = {
+      disk: ormDisk,
+      diskFreshMs: ORM_DISK_REFRESH_DAYS * 86400000,
+      cacheKey: `mvt2:${upstreamUrl}`,
+      transform: mltTileToMvt,
+      validate: isMvtResponse,
+      headers: {
+        'user-agent': USER_AGENT,
+        'referer': REFERER,
+        'accept': 'application/vnd.maplibre-vector-tile, application/x-protobuf;q=0.9',
+        'accept-encoding': 'gzip, deflate, br',
+      },
+    };
+    const fetchTile = async () => {
+      let tile = await fetchCached(upstreamUrl, TTL.tile, `tiles:${name}`, tileOptions);
+      if (tile.invalid) {
+        const mvtUrl = `${upstreamUrl}${upstreamUrl.includes('?') ? '&' : '?'}mvt=1`;
+        tile = await fetchCached(mvtUrl, TTL.tile, `tiles:${name}`, tileOptions);
+        if (tile.invalid) recordFailure(`tiles:${name}`, 'only available as MLT');
+      }
+      return tile;
+    };
+    const usable = (tile) => tile && !tile.invalid && (isOk(tile) || tile.status === 204 || tile.status === 404);
+    const tileId = { name, z: Number(z), x: Number(x), y: Number(y), lang };
+    const startedAt = Date.now();
+    const origin = cache.get(`mvt2:${upstreamUrl}`) ? 'memory' : null;
+    const pending = fetchTile();
+    const logTile = (status, body, how) => {
+      tileStats.served[how] = (tileStats.served[how] || 0) + 1;
+      if (!TILE_LOG) return;
+      const counts = status === 200 ? summarizeMvt(body) : {};
+      if (counts === null) tileStats.unreadable += 1;
+      tileLog(`tile ${name.split(',')[0]} ${z}/${x}/${y} ${status} ${body ? body.length : 0}B ${how} ${Date.now() - startedAt}ms ${counts === null ? 'UNREADABLE' : Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(' ')}`);
+    };
+
+    let result = await Promise.race([pending, new Promise((resolve) => setTimeout(() => resolve(null), STANDIN_AFTER_MS))]);
+    if (!result) {
+      // Still downloading: answer now with a stand-in from other zoom levels, if there is one.
+      const standIn = await buildStandIn(tileId);
+      if (standIn) {
+        tileStats.standIns += 1;
+        sendBody(response, 200, 'application/x-protobuf', standIn, 'no-store');
+        logTile(200, standIn, 'stand-in');
+        pending.then(
+          (tile) => announceTile(tileId, usable(tile) ? 0 : TTL.error),
+          () => announceTile(tileId, TTL.error),
+        );
+        return;
+      }
+      result = await pending;
+    }
+
+    if (!usable(result)) {
+      // Failed: never leave the game with an error (it would not ask again). Show a stand-in or
+      // nothing for now, and have the mod ask for the tile again once the failure has expired.
+      const standIn = await buildStandIn(tileId);
+      announceTile(tileId, TTL.error);
+      if (standIn) {
+        tileStats.standIns += 1;
+        sendBody(response, 200, 'application/x-protobuf', standIn, 'no-store');
+        logTile(200, standIn, `failed(${result?.status ?? 'error'})+stand-in`);
+      } else {
+        response.writeHead(204, { 'cache-control': 'no-store' });
+        response.end();
+        logTile(204, null, `failed(${result?.status ?? 'error'})`);
+      }
+      return;
+    }
+    const how = origin || (result.fromDisk ? 'disk' : result.converted ? 'upstream-mlt' : 'upstream');
     if (result.status === 204 || result.status === 404) {
       // Empty tile: nothing to draw here.
       response.writeHead(204, { 'cache-control': CLIENT_CACHE_CONTROL.tile });
       response.end();
+      logTile(result.status, null, how);
       return;
     }
-    if (!isOk(result)) return sendUpstreamError(response, result, `tiles:${name}`);
-    sendBody(response, 200, result.contentType || 'application/x-protobuf', result.body, CLIENT_CACHE_CONTROL.tile);
+    sendBody(response, 200, 'application/x-protobuf', result.body, CLIENT_CACHE_CONTROL.tile);
+    logTile(200, result.body, how);
+    return;
+  }
+
+  if (pathname === '/tiles/ready') {
+    // The mod asks which tiles it should reload (stand-ins whose real tile has arrived, or
+    // failed tiles worth another try).
+    const since = Number.parseInt(url.searchParams.get('since') || '0', 10) || 0;
+    const tiles = readyTiles.filter((entry) => entry.seq > since);
+    sendJson(response, 200, { seq: readySeq, tiles: tiles.map(({ name, z, x, y }) => ({ name, z, x, y })) });
     return;
   }
 
   const spriteMatch = pathname.match(SPRITE_PATH);
   if (spriteMatch) {
     const [, kind, retina = '', ext] = spriteMatch;
-    const result = await fetchCached(`${UPSTREAM}/${kind}/symbols${retina}.${ext}`, TTL.sprite, 'sprite');
+    const result = await fetchCached(`${UPSTREAM}/${kind}/symbols${retina}.${ext}`, TTL.sprite, 'sprite', { disk: ormDisk, diskFreshMs: TTL.sprite });
     if (!isOk(result)) return sendUpstreamError(response, result, 'sprite');
     sendBody(response, 200, result.contentType || (ext === 'json' ? 'application/json' : 'image/png'), result.body, CLIENT_CACHE_CONTROL.sprite);
     return;
@@ -456,6 +785,7 @@ async function handleRequest(request, response) {
       cacheKey: `${providerId}/${z}/${x}/${y}`,
       headers: { 'user-agent': USER_AGENT, 'accept': 'image/avif,image/webp,image/png,image/jpeg,*/*' },
       respectUpstreamCache: provider.respectUpstreamCache === true,
+      ...(provider.keylessGoogle ? { disk: googleKeylessDisk, diskFreshMs: GOOGLE_KEYLESS_REFRESH_DAYS * 86400000 } : {}),
     });
     if (result.status === 204 || result.status === 404) {
       response.writeHead(204, { 'cache-control': CLIENT_CACHE_CONTROL.tile });
@@ -509,11 +839,14 @@ async function getGoogleSession() {
 function rewriteStyle(style, base) {
   const sources = {};
   for (const [id, source] of Object.entries(style.sources || {})) {
+    // The proxy serves classic vector tiles only (see the tile route), so drop the MLT encoding.
+    const { encoding, ...rest } = source || {};
+    void encoding;
     if (source && typeof source.url === 'string' && source.url.startsWith('/')) {
       const name = source.url.slice(1).split('?')[0];
-      sources[id] = { ...source, url: `${base}/orm/tilejson/${name}` };
+      sources[id] = { ...rest, url: `${base}/orm/tilejson/${name}` };
     } else {
-      sources[id] = source;
+      sources[id] = source && source.type === 'vector' ? rest : source;
     }
   }
 
@@ -538,7 +871,7 @@ function rewriteStyle(style, base) {
 }
 
 function rewriteTileJson(tileJson, name, lang, base) {
-  const query = lang ? `?lang=${encodeURIComponent(lang)}` : '';
+  const query = `?${lang ? `lang=${encodeURIComponent(lang)}&` : ''}v=${TILE_URL_VERSION}`;
   return {
     ...tileJson,
     tiles: [`${base}/orm/tiles/${name}/{z}/{x}/{y}${query}`],
@@ -564,39 +897,73 @@ async function fetchCached(url, ttl, category, options = {}) {
   const key = options.cacheKey || url;
   const cached = store.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached;
-  // Only real data may be served stale; remembered failures just expire.
-  const stale = cached && !cached.failed ? cached : null;
-
   if (inflight.has(key)) return inflight.get(key);
 
-  const promise = withUpstreamSlot(() => fetchUpstream(url, options.headers))
-    .then((result) => {
-      const success = result.status < 400 || result.status === 404;
-      let entryTtl = success ? ttl : TTL.error;
-      if (success && options.respectUpstreamCache) entryTtl = upstreamCacheTtl(result.cacheControl);
-      const entry = { ...result, expiresAt: Date.now() + entryTtl };
-      if (success && entryTtl <= 0) return entry;
-      if (success) {
-        store.set(key, entry, entry.body.length + 256);
-      } else if (stale) {
-        // Serve stale data if upstream is having trouble.
-        recordFailure(category, `status=${result.status} (served stale)`);
-        return stale;
-      } else {
-        recordFailure(category, `status=${result.status}`);
-        // Remember the failure briefly so a refusing server is not hammered by repeat requests.
-        store.set(key, { ...entry, failed: true }, entry.body.length + 256);
+  const promise = (async () => {
+    // Only real data may be served stale; remembered failures just expire.
+    let stale = cached && !cached.failed ? cached : null;
+
+    // 1. The disk cache (survives restarts).
+    if (options.disk) {
+      const stored = await options.disk.get(key);
+      if (stored) {
+        const entry = { status: stored.status, body: stored.body, contentType: stored.contentType, expiresAt: Date.now() + ttl, fromDisk: true };
+        const fresh = !options.diskFreshMs || Date.now() - stored.storedAt < options.diskFreshMs;
+        if (fresh) {
+          store.set(key, entry, entry.body.length + 256);
+          return entry;
+        }
+        stale = entry;
       }
-      return entry;
-    })
-    .catch((error) => {
+    }
+
+    // 2. Upstream.
+    let result;
+    try {
+      result = await withUpstreamSlot(() => fetchUpstream(url, options.headers));
+    } catch (error) {
       recordFailure(category, error.code || error.name || 'error');
       upstreamState.lastFailureAt = new Date().toISOString();
       upstreamState.lastFailure = formatError(error);
       if (stale) return stale;
       return { status: 502, body: Buffer.from(JSON.stringify({ error: 'upstream_unreachable', message: formatError(error) })), contentType: 'application/json', error };
-    })
-    .finally(() => inflight.delete(key));
+    }
+
+    if (options.transform && result.status >= 200 && result.status < 300) {
+      // e.g. convert an MLT tile to MVT before it is cached anywhere.
+      try {
+        result = options.transform(result);
+      } catch (error) {
+        recordFailure(category, `conversion failed (${error?.message || error})`);
+        return { ...result, invalid: true, expiresAt: Date.now() };
+      }
+    }
+    const success = result.status < 400 || result.status === 404;
+    let entryTtl = success ? ttl : TTL.error;
+    if (success && options.respectUpstreamCache) entryTtl = upstreamCacheTtl(result.cacheControl);
+    const entry = { ...result, expiresAt: Date.now() + entryTtl };
+    // A response the caller can't use (e.g. a tile in the wrong format) is never cached.
+    if (success && result.status < 300 && options.validate && !options.validate(result)) {
+      return { ...entry, invalid: true };
+    }
+    if (success && entryTtl <= 0) return entry;
+    if (success) {
+      store.set(key, entry, entry.body.length + 256);
+      if (options.disk && (result.status < 300 || result.status === 404)) {
+        void options.disk.set(key, { status: result.status, contentType: result.contentType, body: result.body });
+      }
+      return entry;
+    }
+    if (stale) {
+      // Serve stale data if upstream is having trouble.
+      recordFailure(category, `status=${result.status} (served stored copy)`);
+      return stale;
+    }
+    recordFailure(category, `status=${result.status}`);
+    // Remember the failure briefly so a refusing server is not hammered by repeat requests.
+    store.set(key, { ...entry, failed: true }, entry.body.length + 256);
+    return entry;
+  })().finally(() => inflight.delete(key));
 
   inflight.set(key, promise);
   return promise;
@@ -650,7 +1017,8 @@ function withUpstreamSlot(task) {
         .then(resolve, reject)
         .finally(() => {
           upstreamActive -= 1;
-          const next = upstreamQueue.shift();
+          // Newest first: tiles for the view on screen now beat ones for views already left.
+          const next = upstreamQueue.pop();
           if (next) next();
         });
     };
@@ -660,6 +1028,101 @@ function withUpstreamSlot(task) {
 }
 
 let warnedForbidden = false;
+
+/** Converts an MLT tile response to MVT; MVT responses pass through unchanged. */
+function mltTileToMvt(result) {
+  const type = String(result.contentType || '').toLowerCase();
+  const isMlt = /maplibre|mlt/.test(type) || (!/protobuf|mapbox-vector-tile/.test(type) && !looksLikeMvt(result.body));
+  if (!isMlt || !result.body || result.body.length === 0) return result;
+  tileStats.converted += 1;
+  return { ...result, body: mltToMvt(result.body), contentType: 'application/x-protobuf', converted: true };
+}
+
+const tileStats = { converted: 0, standIns: 0, unreadable: 0, served: {}, clientReports: 0 };
+
+// --------------------------------------------------------------------------
+// Stand-in tiles and the "ready" list
+// --------------------------------------------------------------------------
+
+const readyTiles = [];
+let readySeq = 0;
+
+/** Tells the mod (via /tiles/ready) that a tile should be reloaded, after `delayMs`. */
+function announceTile(tile, delayMs) {
+  const push = () => {
+    readySeq += 1;
+    readyTiles.push({ ...tile, seq: readySeq });
+    if (readyTiles.length > 5000) readyTiles.splice(0, readyTiles.length - 5000);
+  };
+  if (delayMs > 0) setTimeout(push, delayMs).unref?.();
+  else push();
+}
+
+function tileUpstreamUrl(name, z, x, y, lang) {
+  return `${UPSTREAM}/${name}/${z}/${x}/${y}${lang ? `?lang=${encodeURIComponent(lang)}` : ''}`;
+}
+
+/** A tile already saved in memory or on disk (MVT), or null. Empty tiles return an empty buffer. */
+async function savedTile(name, z, x, y, lang) {
+  if (z < 0 || z > 24) return null;
+  const key = `mvt2:${tileUpstreamUrl(name, z, x, y, lang)}`;
+  const memory = cache.get(key);
+  if (memory && !memory.failed && !memory.invalid) {
+    if (memory.status === 204 || memory.status === 404) return Buffer.alloc(0);
+    if (memory.status === 200 && memory.body) return memory.body;
+  }
+  const disk = await ormDisk.get(key);
+  if (disk) {
+    if (disk.status === 204 || disk.status === 404) return Buffer.alloc(0);
+    if (disk.status === 200) return disk.body;
+  }
+  return null;
+}
+
+/**
+ * Builds a stand-in for a tile from saved tiles of nearby zoom levels: its children (one or two
+ * levels down - common after zooming out) or else its nearest saved ancestor (up to 6 levels up -
+ * common after zooming in). Returns null if nothing suitable is saved.
+ */
+async function buildStandIn({ name, z, x, y, lang }) {
+  for (const depth of [1, 2]) {
+    const n = 1 << depth;
+    const size = 4096 / n;
+    const parts = [];
+    let known = 0;
+    for (let i = 0; i < n; i += 1) {
+      for (let j = 0; j < n; j += 1) {
+        const bytes = await savedTile(name, z + depth, x * n + i, y * n + j, lang);
+        if (!bytes) continue;
+        known += 1;
+        if (bytes.length) parts.push({ bytes, scale: 1 / n, dx: i * size, dy: j * size });
+      }
+    }
+    if (known) {
+      const composed = parts.length ? composeTile(parts) : null;
+      if (composed) return composed;
+    }
+  }
+  for (let depth = 1; depth <= 6 && z - depth >= 0; depth += 1) {
+    const bytes = await savedTile(name, z - depth, x >> depth, y >> depth, lang);
+    if (!bytes) continue;
+    if (!bytes.length) return null; // the ancestor is empty, so this tile is too
+    const mask = (1 << depth) - 1;
+    const composed = composeTile([{ bytes, scale: 1 << depth, dx: -(x & mask) * 4096, dy: -(y & mask) * 4096 }]);
+    if (composed) return composed;
+  }
+  return null;
+}
+
+/** True if a tile response is a classic Mapbox Vector Tile (or empty), not MLT. */
+function isMvtResponse(result) {
+  if (result.status === 204 || !result.body || result.body.length === 0) return true;
+  const type = String(result.contentType || '').toLowerCase();
+  if (/maplibre|mlt/.test(type)) return false;
+  if (/protobuf|mapbox-vector-tile|mvt/.test(type)) return true;
+  // Unknown type: an MVT tile is a list of layers, which always starts with byte 0x1a.
+  return result.body[0] === 0x1a;
+}
 
 /** How long an upstream response may be kept, per its own Cache-Control header (0 = don't keep). */
 function upstreamCacheTtl(cacheControl) {
@@ -714,6 +1177,10 @@ function LruCache(maxBytes) {
     stats() {
       return { entries: map.size, bytes, maxBytes };
     },
+    clear() {
+      map.clear();
+      bytes = 0;
+    },
   };
 }
 
@@ -727,6 +1194,7 @@ function buildHealth() {
     ready: true,
     status: 'ready',
     service: 'open-overlay-proxy',
+    statusPort: STATUS_PORT,
     version: VERSION,
     upstream: UPSTREAM,
     upstreamLastSuccessAt: upstreamState.lastSuccessAt,
@@ -736,8 +1204,16 @@ function buildHealth() {
     upstreamActive,
     upstreamQueued: upstreamQueue.length,
     referer: REFERER,
+    tilesConvertedFromMlt: tileStats.converted,
+    standInTilesServed: tileStats.standIns,
+    tilesServed: tileStats.served,
+    unreadableTiles: tileStats.unreadable,
+    clientReports: tileStats.clientReports,
+    tileLog: TILE_LOG ? TILE_LOG_PATH : null,
     cache: cache.stats(),
     satelliteCache: satelliteCache.stats(),
+    diskCacheDir: DISK_CACHE_DIR,
+    diskCache: Object.fromEntries(Object.entries(DISK_CACHES).map(([id, disk]) => [id, disk.stats()])),
     satelliteProviders: SATELLITE_PROVIDERS.map((provider) => ({
       id: provider.id,
       label: provider.label,
@@ -781,6 +1257,30 @@ function recordFailure(category, reason) {
     failureCounts.clear();
     if (summary) log(`Upstream problems in the last 15 s: ${summary}`);
   }, 15000);
+}
+
+function tileLog(message) {
+  try {
+    if (fs.existsSync(TILE_LOG_PATH) && fs.statSync(TILE_LOG_PATH).size > TILE_LOG_MAX_BYTES) {
+      fs.renameSync(TILE_LOG_PATH, `${TILE_LOG_PATH}.old`);
+    }
+    fs.appendFileSync(TILE_LOG_PATH, `[${new Date().toISOString()}] ${message}\n`);
+  } catch {
+    // diagnostics only
+  }
+}
+
+function readText(request, limit) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    request.on('data', (chunk) => {
+      size += chunk.length;
+      if (size <= limit) chunks.push(chunk);
+    });
+    request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    request.on('error', () => resolve(''));
+  });
 }
 
 function log(message) {
